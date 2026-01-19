@@ -1,28 +1,11 @@
-from schnapsen.game import Bot, PlayerPerspective, SchnapsenDeckGenerator, Move, Trick, GamePhase, Hand
+from schnapsen.game import Bot, PlayerPerspective, SchnapsenDeckGenerator, Move, Trick, GamePhase
 from typing import Optional, cast, Literal
-from schnapsen.deck import Suit, Rank, Card
+from schnapsen.deck import Suit, Rank
 from sklearn.neural_network import MLPClassifier
 from sklearn.linear_model import LogisticRegression
 import joblib
 import time
 import pathlib
-from typing import *
-
-
-def map_cards_to_ownership(perspective: PlayerPerspective) -> dict[Card, int]:
-    ownership: dict[Card, int] = {}
-    for card in SchnapsenDeckGenerator().get_initial_deck():
-
-        if card in perspective.get_hand().cards:
-            ownership[card] = 0  # on player's hand
-        elif card in perspective.get_won_cards().get_cards() or card in perspective.get_opponent_won_cards().get_cards():
-            ownership[card] = 1  # out of the game
-        elif card in perspective.get_known_cards_of_opponent_hand():
-            ownership[card] = 2 # Known to be on opponent's hand
-        else:
-            ownership[card] = 3  # unknown (deck/opponent's hand)
-
-    return ownership
 
 
 class MLPlayingBot(Bot):
@@ -32,7 +15,7 @@ class MLPlayingBot(Bot):
 
     def __init__(self, model_location: pathlib.Path, name: Optional[str] = None) -> None:
         """
-        Create a new MLPlayingBot which uses the model stored in the model_location.
+        Create a new MLPlayingBot which uses the model stored in the mofel_location.
 
         :param model_location: The file containing the model.
         """
@@ -119,129 +102,28 @@ class MLDataBot(Bot):
         # we also save the training label "won or lost"
         won_label = won
 
-        feature_list: List[List[bool]] = []
-        trick_list: List[Trick] = []
-        """
-        For each round
-        1. Is leading
-        2. Phase (0 = first, 1 = second)
-        3-23. For each card in the deck: is_in_hand (20)
-        24-44. For each card in the deck: is_out (20)
-        45-65. For each card in the deck: is_unknown (20)
-        66-86. For each card in the deck: is_known_opponent (20)
-        87-107. For each card in the deck: is_trump (20)
-        108-130. For each card in the deck + Trump exchange + Marriage: is_legal (22)
-        131-151 + Trump exchange + Marriage: led_card (22) - to add
-        """
-        round_number = 0
         # we iterate over all the rounds of the game
-        for round_player_perspective, _ in game_history:
+        for round_player_perspective, round_trick in game_history:
 
-
-
-            # For each round, append if the bot was leading
-            if round_number >= len(feature_list):
-                feature_list.append([])
-            # convert leader flag to int so the training file contains integers
-            feature_list[round_number].append(bool(round_player_perspective.am_i_leader()))
-            feature_list[round_number].append(bool(round_player_perspective.get_phase() == GamePhase.TWO))
-
-            # use the perspective (not the trick) to map card ownership
-            ownership_values = list(map_cards_to_ownership(round_player_perspective).values())
-                    # For each round, append the ownership information of each card in the deck
-                    # is_in_hand for all 20; is_out for all 20, is_known_opponent for all 20, is_unknown each batch consecutively
-            for value in ownership_values:
-                feature_list[round_number].append(value == 0)
-
-            for value in ownership_values:
-                feature_list[round_number].append(value == 1)
-
-            for value in ownership_values:
-                feature_list[round_number].append(value == 2)
-
-            for value in ownership_values:
-                feature_list[round_number].append(value == 3)
-
-
-            # Trumps
-            for card in SchnapsenDeckGenerator().get_initial_deck():
-                if card.suit == round_player_perspective.get_trump_suit():
-                    feature_list[round_number].append(True)
-                else:
-                    feature_list[round_number].append(False)
-            # Led card mask
-
-                """
-                if round_trick.leader_move.is_marriage():
-                    pass
-                if round_trick.leader_move.is_trump_exchange():
-                    pass
-                else:
-                    pass
-                """
-            #Legal moves
-
-            valid_moves = round_player_perspective.valid_moves()
-            is_marriage_possible, is_trump_exchange_possible = False, False
-            for card in SchnapsenDeckGenerator().get_initial_deck():
-                is_legal = False
-                for move in valid_moves:
-                    if move.is_marriage():
-                        is_marriage_possible = True
-                    if move.is_trump_exchange():
-                        is_trump_exchange_possible = True
-                    if move.is_regular_move():
-                        if move.card == card:
-                            is_legal = True
-                            break
-                feature_list[round_number].append(is_legal)
-                feature_list[round_number].append(is_marriage_possible)
-                feature_list[round_number].append(is_trump_exchange_possible)
-
-
-
-            print (feature_list[round_number], "\n\n")
-            # append replay memory to file - write the constructed feature vector (as ints)
-            with open(file=self.replay_memory_file_path, mode="a") as replay_memory_file:
-                replay_memory_file.write(f"{str(feature_list[round_number])} || {int(won_label)}\n")
-            round_number += 1
-
-        round_number = 0
-        trick_list: [List[bool]] = [False for _ in range(22)]
-        for _, round_trick in game_history:
             if round_trick.is_trump_exchange():
-                trick_list[20] = True
+                leader_move = round_trick.exchange
+                follower_move = None
             else:
-                # round_trick.cards may be an iterable/generator; safely check for exactly two items
-                cards_iter = iter(round_trick.cards)
-                first = next(cards_iter, None)
-                print ("first", first)
-                second = next(cards_iter, None)
-                print ("second", second)
-                third = next(cards_iter, None)
-                print ("third", third)
-                if first is not None and second is not None and third is not None:
-                    trick_list[21] = True
-                    print("marriage found")
-                else:
-                    trick_card = round_trick.as_partial
-                    counter = 0
+                leader_move = round_trick.leader_move
+                follower_move = round_trick.follower_move
 
-                    for card in SchnapsenDeckGenerator().get_initial_deck():
-                        if trick_card is not None and card == trick_card:
-                            trick_list[counter] = True
-                            print ("marriage found")
-                        else:
-                            trick_list[counter] = False
-                        counter += 1
-            print ("trick list", trick_list)
+            # we do not want this representation to include actions that followed. So if this agent was the leader, we ignore the followers move
+            if round_player_perspective.am_i_leader():
+                follower_move = None
+
+            state_actions_representation = create_state_and_actions_vector_representation(
+                perspective=round_player_perspective, leader_move=leader_move, follower_move=follower_move)
+
+            # append replay memory to file
             with open(file=self.replay_memory_file_path, mode="a") as replay_memory_file:
-                replay_memory_file.write(f"trick list: \n {(trick_list)} \n")
-
-
-
-
-
+                # replay_memory_line: list[tuple[list, number]] = [state_actions_representation, won_label]
+                # writing to replay memory file in the form "[feature list] || int(won_label)]
+                replay_memory_file.write(f"{str(state_actions_representation)[1:-1]} || {int(won_label)}\n")
 
 
 def train_ML_model(replay_memory_location: Optional[pathlib.Path],
@@ -251,7 +133,7 @@ def train_ML_model(replay_memory_location: Optional[pathlib.Path],
     """
     Train the ML model for the MLPlayingBot based on replay memory stored byt the MLDataBot.
     This implementation has the option to train a neural network model or a model based on linear regression.
-    The model classes used in this implementation are not necessarily optimal.
+    The model classes used in this implemntation are not necesarily optimal.
 
     :param replay_memory_location: Location of the games stored by MLDataBot, default pathlib.Path('ML_replay_memories') / 'test_replay_memory'
     :param model_location: Location where the model will be stored, default pathlib.Path("ML_models") / 'test_model'
@@ -302,7 +184,7 @@ def train_ML_model(replay_memory_location: Optional[pathlib.Path],
         # Play around with the model parameters below
         print("Training a Complex (Neural Network) model.")
 
-        # Feel free to experiment with different number of neural layers or different type of neurons per layer
+        # Feel free to experiment with different number of neural layers or differnt type of neurons per layer
         # Tips: more neurons or more layers of neurons create a more complicated model that takes more time to train and
         # needs a bigger dataset, but if you find the correct combination of neurons and neural layers and provide a big enough training dataset can lead to better performance
 
