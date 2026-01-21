@@ -2,7 +2,8 @@ from schnapsen.game import Bot, PlayerPerspective, SchnapsenDeckGenerator, Move,
 from typing import Optional, cast, Literal
 from schnapsen.deck import Suit, Rank, Card
 from sklearn.neural_network import MLPClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.multioutput import MultiOutputRegressor
 import joblib
 import time
 import pathlib
@@ -10,6 +11,19 @@ from typing import *
 
 
 def map_cards_to_ownership(perspective: PlayerPerspective) -> dict[Card, int]:
+
+    """
+    Function that maps each card in the deck to the ownership status according to the perspective parameter.
+
+    :param perspective: The PlayerPerspective of the bot - will determine which cards were possible to be seen at the call of the function
+
+    :return: A dictionary mapping each card to an integer representing its ownership status:
+             0 - on player's hand
+             1 - out of the game (won cards)
+             2 - known to be on opponent's hand (from marriages or trump exchanges)
+             3 - unknown (deck/opponent's hand)
+
+    """
     ownership: dict[Card, int] = {}
     for card in SchnapsenDeckGenerator().get_initial_deck():
 
@@ -67,7 +81,7 @@ class MLPlayingBot(Bot):
                 action_state_representations.append(
                     state_representation + leader_move_representation + my_move_representation)
 
-        model_output = self.__model.predict_proba(action_state_representations)
+        model_output = self.__model.predict(action_state_representations)
         winning_probabilities_of_moves = [outcome_prob[1] for outcome_prob in model_output]
         highest_value: float = -1
         best_move = None
@@ -134,22 +148,24 @@ class MLDataBot(Bot):
         131-151 + Trump exchange + Marriage: led_card (22) - to add
         """
         round_number = 0
-        # we iterate over all the rounds of the game
-        for round_player_perspective, _ in game_history:
+        # Iterate over all the rounds of the history
+        for round_player_perspective, round_trick in game_history:
 
-
-
-            # For each round, append if the bot was leading
+            # For each round, create a new feature list
             if round_number >= len(feature_list):
                 feature_list.append([])
-            # convert leader flag to int so the training file contains integers
+
+            # 1-2 are whether the bot was leading/following and the phase of the game
             feature_list[round_number].append(bool(round_player_perspective.am_i_leader()))
             feature_list[round_number].append(bool(round_player_perspective.get_phase() == GamePhase.TWO))
 
-            # use the perspective (not the trick) to map card ownership
             ownership_values = list(map_cards_to_ownership(round_player_perspective).values())
-                    # For each round, append the ownership information of each card in the deck
-                    # is_in_hand for all 20; is_out for all 20, is_known_opponent for all 20, is_unknown each batch consecutively
+
+            """
+            For each round, append the ownership information of each card in the deck
+            is_in_hand for all 20 (3-23); is_out for all 20 (24-44), is_known_opponent for all 20 (45-65), is_unknown (66-86) each batch consecutively
+            """
+
             for value in ownership_values:
                 feature_list[round_number].append(value == 0)
 
@@ -163,24 +179,34 @@ class MLDataBot(Bot):
                 feature_list[round_number].append(value == 3)
 
 
-            # Trumps
+            # Add trump suit mask (87-107)
             for card in SchnapsenDeckGenerator().get_initial_deck():
                 if card.suit == round_player_perspective.get_trump_suit():
                     feature_list[round_number].append(True)
                 else:
                     feature_list[round_number].append(False)
-            # Led card mask
 
-                """
-                if round_trick.leader_move.is_marriage():
-                    pass
-                if round_trick.leader_move.is_trump_exchange():
-                    pass
+            # Add led card mask (if not leading) -- 20 + Marriage + Trump exchange (108-130)
+            is_marriage, is_trump_exchange, led_card = False, False, None
+            if not round_player_perspective.am_i_leader():
+                if round_trick.is_trump_exchange():
+                    is_trump_exchange = True
+
+                elif next(round_trick.cards) is not None and next(round_trick.cards) and next(round_trick.cards):
+                    is_marriage = True
+
                 else:
-                    pass
-                """
-            #Legal moves
+                    led_card = next(round_trick.cards)
 
+
+
+            for card in SchnapsenDeckGenerator().get_initial_deck():
+                led_active = (not is_marriage and not is_trump_exchange)
+                feature_list[round_number].append(led_active and (led_card == card))
+                feature_list[round_number].append(bool(is_marriage))
+                feature_list[round_number].append(bool(is_trump_exchange))
+
+            #Legal moves mask (131-153)
             valid_moves = round_player_perspective.valid_moves()
             is_marriage_possible, is_trump_exchange_possible = False, False
             for card in SchnapsenDeckGenerator().get_initial_deck():
@@ -200,48 +226,64 @@ class MLDataBot(Bot):
 
 
 
-            print (feature_list[round_number], "\n\n")
             # append replay memory to file - write the constructed feature vector (as ints)
             with open(file=self.replay_memory_file_path, mode="a") as replay_memory_file:
-                replay_memory_file.write(f"{str(feature_list[round_number])} || {int(won_label)}\n")
+                if int(won_label):
+                    replay_memory_file.write(f"{str(feature_list[round_number])}")
             round_number += 1
 
-        round_number = 0
-        trick_list: [List[bool]] = [False for _ in range(22)]
-        for _, round_trick in game_history:
+
+
+
+            trick_list: [List[bool]] = [False for _ in range(22)]
             if round_trick.is_trump_exchange():
                 trick_list[20] = True
             else:
-                # round_trick.cards may be an iterable/generator; safely check for exactly two items
+                # round_trick.cards is an iterable; check for exactly two items
                 cards_iter = iter(round_trick.cards)
                 first = next(cards_iter, None)
-                print ("first", first)
                 second = next(cards_iter, None)
-                print ("second", second)
                 third = next(cards_iter, None)
-                print ("third", third)
                 if first is not None and second is not None and third is not None:
                     trick_list[21] = True
-                    print("marriage found")
                 else:
-                    trick_card = round_trick.as_partial
+                    trick_card = next(round_trick.cards)
+
                     counter = 0
 
                     for card in SchnapsenDeckGenerator().get_initial_deck():
                         if trick_card is not None and card == trick_card:
                             trick_list[counter] = True
-                            print ("marriage found")
                         else:
                             trick_list[counter] = False
                         counter += 1
-            print ("trick list", trick_list)
             with open(file=self.replay_memory_file_path, mode="a") as replay_memory_file:
-                replay_memory_file.write(f"trick list: \n {(trick_list)} \n")
+                if won_label:
+                    replay_memory_file.write(f"|| {(trick_list)} \n")
+
+        import ast
 
 
+        with open(self.replay_memory_file_path, "r") as f:
+            lines = f.readlines()
 
+        with open(self.replay_memory_file_path, "w") as out:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
 
+                parts = line.split("||")
 
+                converted_parts = []
+
+                for part in parts:
+                    part = part.strip()
+                    bool_list = ast.literal_eval(part)
+                    binary = ", ".join("1" if x else "0" for x in bool_list)
+                    converted_parts.append(binary)
+
+                out.write(" || ".join(converted_parts) + "\n")
 
 
 def train_ML_model(replay_memory_location: Optional[pathlib.Path],
@@ -278,21 +320,37 @@ def train_ML_model(replay_memory_location: Optional[pathlib.Path],
 
     data: list[list[int]] = []
     targets: list[int] = []
-    with open(file=replay_memory_location, mode="r") as replay_memory_file:
-        for line in replay_memory_file:
-            feature_string, won_label_str = line.split("||")
-            feature_list_strings: list[str] = feature_string.split(",")
-            feature_list = [int(feature) for feature in feature_list_strings]
-            won_label = int(won_label_str)
-            data.append(feature_list)
-            targets.append(won_label)
 
+    # Only context
+    import numpy as np
+
+    X = []
+    y = []
+
+    with open(replay_memory_location, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            feature_string, target_string = line.split("||")
+
+            features = [int(v.strip()) for v in feature_string.split(",")]
+            targets = [int(v.strip()) for v in target_string.split(",")]
+
+            X.append(features)
+            y.append(targets)
+
+    X = np.array(X, dtype=np.float32)
+    Y = np.array(y, dtype=np.float32)
+    """
     print("Dataset Statistics:")
     samples_of_wins = sum(targets)
     samples_of_losses = len(targets) - samples_of_wins
     print("Samples of wins:", samples_of_wins)
     print("Samples of losses:", samples_of_losses)
-
+    
+    """
     # What type of model will be used depends on the value of the parameter use_neural_network
     if model_class == 'NN':
         #############################################
@@ -329,14 +387,14 @@ def train_ML_model(replay_memory_location: Optional[pathlib.Path],
         print("Training a Simple (Linear Logistic Regression) model")
 
         # Usually there is no reason to change the hyperparameters of such a simple model but fill free to experiment:
-        learner = LogisticRegression(max_iter=1000)
+        learner = MultiOutputRegressor(LinearRegression())
     else:
         raise AssertionError("Unknown model class")
 
     start = time.time()
     print("Starting training phase...")
 
-    model = learner.fit(data, targets)
+    model = learner.fit(X, Y)
     # Save the model in a file
     joblib.dump(model, model_location)
     end = time.time()
