@@ -55,7 +55,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     engine = SchnapsenGamePlayEngine()
 
     # create two MLDataBots wrapping random bots with deterministic seeds so dataset is reproducible
-    bot1 = MLDataBot(BullyBot(random.Random(args.seed + 11), name=f"randbot_{args.seed+11}"), replay_memory_location=out_path)
+    bot1 = MLDataBot(RandBot(random.Random(args.seed + 11), name=f"randbot_{args.seed+11}"), replay_memory_location=out_path)
     bot2 = MLDataBot(RandBot(random.Random(args.seed + 22), name=f"randbot_{args.seed+22}"), replay_memory_location=out_path)
 
     print(f"Starting generation of {args.games} games (this will append to {out_path})\n\n")

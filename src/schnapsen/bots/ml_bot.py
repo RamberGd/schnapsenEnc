@@ -1,4 +1,4 @@
-from schnapsen.game import Bot, PlayerPerspective, SchnapsenDeckGenerator, Move, Trick, GamePhase, Hand
+from schnapsen.game import Bot, PlayerPerspective, SchnapsenDeckGenerator, Move, Trick, GamePhase, Hand, Previous
 from typing import Optional, cast, Literal
 from schnapsen.deck import Suit, Rank, Card
 from sklearn.neural_network import MLPClassifier
@@ -56,41 +56,99 @@ class MLPlayingBot(Bot):
         # load model
         self.__model = joblib.load(model_location)
 
+        # Determine how many features the loaded model expects.
+        # Some wrappers (e.g., MultiOutputRegressor) store it on the first estimator.
+        self.__expected_n_features: Optional[int] = None
+        if hasattr(self.__model, "n_features_in_"):
+            self.__expected_n_features = int(getattr(self.__model, "n_features_in_"))
+        elif hasattr(self.__model, "estimators_") and getattr(self.__model, "estimators_", None):
+            first = getattr(self.__model, "estimators_")[0]
+            if hasattr(first, "n_features_in_"):
+                self.__expected_n_features = int(getattr(first, "n_features_in_"))
+
+    def _score_candidates(self, X: "list[list[int]]") -> "list[float]":
+        """Return one scalar score per row in X.
+
+        Supports both:
+        - classifiers (prefer `predict_proba`), returning P(class=1)
+        - regressors / MultiOutputRegressor, returning a vector; we use the mean as a scalar score.
+        """
+        import numpy as np
+
+        X_np = np.asarray(X, dtype=np.float32)
+
+        # Classifier path
+        if hasattr(self.__model, "predict_proba"):
+            proba = self.__model.predict_proba(X_np)
+            # Some sklearn wrappers return a list (e.g., multioutput classifiers)
+            if isinstance(proba, list):
+                # Use the first output head by default; take probability of positive class (index 1)
+                proba0 = np.asarray(proba[0])
+                if proba0.ndim == 2 and proba0.shape[1] >= 2:
+                    return proba0[:, 1].astype(float).tolist()
+                return proba0.reshape(-1).astype(float).tolist()
+
+            proba_arr = np.asarray(proba)
+            if proba_arr.ndim == 2 and proba_arr.shape[1] >= 2:
+                return proba_arr[:, 1].astype(float).tolist()
+            return proba_arr.reshape(-1).astype(float).tolist()
+
+        # Regressor path
+        y_hat = self.__model.predict(X_np)
+        y_arr = np.asarray(y_hat, dtype=np.float32)
+        if y_arr.ndim == 1:
+            return y_arr.astype(float).tolist()
+        # Vector output (e.g., 22 values): reduce to a scalar.
+        return y_arr.mean(axis=1).astype(float).tolist()
+
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
-        # get the sate feature representation
+        """Choose the move with the best predicted outcome.
+
+        Important: the model is trained on *state* feature vectors produced by `get_state_feature_vector`.
+        Those state vectors already include (a) led-card information when following and (b) a legal-moves mask.
+        So, at inference time we score each valid move by concatenating:
+            [state_features] + [candidate_move_mask_22]
+        where the move mask matches the format stored by `MLDataBot` as the target after `||`.
+        """
         state_representation = get_state_feature_vector(perspective)
-        # get the leader's move representation, even if it is None
-        leader_move_representation = get_move_feature_vector(leader_move)
-        # get all my valid moves
+
         my_valid_moves = perspective.valid_moves()
-        # get the feature representations for all my valid moves
-        my_move_representations: list[list[int]] = []
-        for my_move in my_valid_moves:
-            my_move_representations.append(get_move_feature_vector(my_move))
+        assert len(my_valid_moves) > 0, "No valid moves available"
 
-        # create all model inputs, for all bot's valid moves
-        action_state_representations: list[list[int]] = []
+        # Build 22-dim move masks in the same format as the replay-memory target vector.
+        deck = list(SchnapsenDeckGenerator().get_initial_deck())
 
-        if perspective.am_i_leader():
-            follower_move_representation = get_move_feature_vector(None)
-            for my_move_representation in my_move_representations:
-                action_state_representations.append(
-                    state_representation + my_move_representation + follower_move_representation)
-        else:
-            for my_move_representation in my_move_representations:
-                action_state_representations.append(
-                    state_representation + leader_move_representation + my_move_representation)
+        def move_to_mask(m: Move) -> list[int]:
+            mask = [0 for _ in range(22)]
+            if m.is_trump_exchange():
+                mask[20] = 1
+                return mask
+            if m.is_marriage():
+                mask[21] = 1
+                return mask
+            for i, c in enumerate(deck):
+                if m.is_regular_move() and m.card == c:
+                    mask[i] = 1
+                    break
+            return mask
 
-        model_output = self.__model.predict(action_state_representations)
-        winning_probabilities_of_moves = [outcome_prob[1] for outcome_prob in model_output]
-        highest_value: float = -1
-        best_move = None
-        for index, value in enumerate(winning_probabilities_of_moves):
-            if value > highest_value:
-                highest_value = value
-                best_move = my_valid_moves[index]
-        assert best_move is not None, "We went over all the moves, selecting the one we expect to lead to the highest average score. Simce there must have been at least one move at the start, this can never be None"
-        return best_move
+        X: list[list[int]] = []
+
+        # Some existing saved models in this repo were trained on the state vector only.
+        # If the model expects 222 features, feed only the state; otherwise feed state+action mask.
+        use_action_mask = self.__expected_n_features not in (222, len(state_representation))
+
+        for mv in my_valid_moves:
+            if use_action_mask:
+                X.append(state_representation + move_to_mask(mv))
+            else:
+                X.append(state_representation)
+
+        scores = self._score_candidates(X)
+        assert len(scores) == len(my_valid_moves), "Model returned unexpected number of scores"
+
+        best_idx = max(range(len(scores)), key=lambda i: scores[i])
+        return my_valid_moves[best_idx]
 
 
 class MLDataBot(Bot):
@@ -349,7 +407,7 @@ def train_ML_model(replay_memory_location: Optional[pathlib.Path],
     samples_of_losses = len(targets) - samples_of_wins
     print("Samples of wins:", samples_of_wins)
     print("Samples of losses:", samples_of_losses)
-    
+
     """
     # What type of model will be used depends on the value of the parameter use_neural_network
     if model_class == 'NN':
@@ -505,101 +563,80 @@ def get_move_feature_vector(move: Optional[Move]) -> list[int]:
 
 def get_state_feature_vector(perspective: PlayerPerspective) -> list[int]:
     """
-        This function gathers all subjective information that this bot has access to, that can be used to decide its next move, including:
-        - points of this player (int)
-        - points of the opponent (int)
-        - pending points of this player (int)
-        - pending points of opponent (int)
-        - the trump suit (1-hot encoding)
-        - phase of game (1-hoy encoding)
-        - talon size (int)
-        - if this player is leader (1-hot encoding)
-        - What is the status of each card of the deck (where it is, or if its location is unknown)
 
-        Important: This function should not include the move of this agent.
-        It should only include any earlier actions of other agents (so the action of the other agent in case that is the leader)
+
     """
     # a list of all the features that consist the state feature set, of type np.ndarray
     state_feature_list: list[int] = []
 
-    player_score = perspective.get_my_score()
-    # - points of this player (int)
-    player_points = player_score.direct_points
-    # - pending points of this player (int)
-    player_pending_points = player_score.pending_points
+    # am_i_leader is a method; store its boolean value
+    state_feature_list.append(int(perspective.am_i_leader()))
+    state_feature_list.append(int(perspective.get_phase() == GamePhase.TWO))
 
-    # add the features to the feature set
-    state_feature_list += [player_points]
-    state_feature_list += [player_pending_points]
+    ownership_values = (map_cards_to_ownership(perspective).values())
 
-    opponents_score = perspective.get_opponent_score()
-    # - points of the opponent (int)
-    opponents_points = opponents_score.direct_points
-    # - pending points of opponent (int)
-    opponents_pending_points = opponents_score.pending_points
+    for value in ownership_values:
+        state_feature_list.append(int(value == 0))
 
-    # add the features to the feature set
-    state_feature_list += [opponents_points]
-    state_feature_list += [opponents_pending_points]
+    for value in ownership_values:
+        state_feature_list.append(int(value == 1))
 
-    # - the trump suit (1-hot encoding)
-    trump_suit = perspective.get_trump_suit()
-    trump_suit_one_hot = get_one_hot_encoding_of_card_suit(trump_suit)
-    # add this features to the feature set
-    state_feature_list += trump_suit_one_hot
+    for value in ownership_values:
+        state_feature_list.append(int(value == 2))
 
-    # - phase of game (1-hot encoding)
-    game_phase_encoded = [1, 0] if perspective.get_phase() == GamePhase.TWO else [0, 1]
-    # add this features to the feature set
-    state_feature_list += game_phase_encoded
-
-    # - talon size (int)
-    talon_size = perspective.get_talon_size()
-    # add this features to the feature set
-    state_feature_list += [talon_size]
-
-    # - if this player is leader (1-hot encoding)
-    i_am_leader = [0, 1] if perspective.am_i_leader() else [1, 0]
-    # add this features to the feature set
-    state_feature_list += i_am_leader
-
-    # gather all known deck information
-    hand_cards = perspective.get_hand().cards
-    trump_card = perspective.get_trump_card()
-    won_cards = perspective.get_won_cards().get_cards()
-    opponent_won_cards = perspective.get_opponent_won_cards().get_cards()
-    opponent_known_cards = perspective.get_known_cards_of_opponent_hand().get_cards()
-    # each card can either be i) on player's hand, ii) on player's won cards, iii) on opponent's hand, iv) on opponent's won cards
-    # v) be the trump card or vi) in an unknown position -> either on the talon or on the opponent's hand
-    # There are all different cases regarding card's knowledge, and we represent these 6 cases using one hot encoding vectors as seen bellow.
-
-    deck_knowledge_in_consecutive_one_hot_encodings: list[int] = []
+    for value in ownership_values:
+        state_feature_list.append(int(value == 3))
 
     for card in SchnapsenDeckGenerator().get_initial_deck():
-        card_knowledge_in_one_hot_encoding: list[int]
-        # i) on player's hand
-        if card in hand_cards:
-            card_knowledge_in_one_hot_encoding = [0, 0, 0, 0, 0, 1]
-        # ii) on player's won cards
-        elif card in won_cards:
-            card_knowledge_in_one_hot_encoding = [0, 0, 0, 0, 1, 0]
-        # iii) on opponent's hand
-        elif card in opponent_known_cards:
-            card_knowledge_in_one_hot_encoding = [0, 0, 0, 1, 0, 0]
-        # iv) on opponent's won cards
-        elif card in opponent_won_cards:
-            card_knowledge_in_one_hot_encoding = [0, 0, 1, 0, 0, 0]
-        # v) be the trump card
-        elif card == trump_card:
-            card_knowledge_in_one_hot_encoding = [0, 1, 0, 0, 0, 0]
-        # vi) in an unknown position as it is invisible to this player. Thus, it is either on the talon or on the opponent's hand
-        else:
-            card_knowledge_in_one_hot_encoding = [1, 0, 0, 0, 0, 0]
-        # This list eventually develops to one long 1-dimensional numpy array of shape (120,)
-        deck_knowledge_in_consecutive_one_hot_encodings += card_knowledge_in_one_hot_encoding
-    # deck_knowledge_flattened: np.ndarray = np.concatenate(tuple(deck_knowledge_in_one_hot_encoding), axis=0)
+        state_feature_list.append(int(card.suit == perspective.get_trump_suit()))
 
-    # add this features to the feature set
-    state_feature_list += deck_knowledge_in_consecutive_one_hot_encodings
+    # --- Correct handling of previous trick when this perspective is the follower ---
+    history = perspective.get_game_history()
+    is_marriage, is_trump_exchange, led_card = False, False, None
+
+    # Only try to look at a previous trick if we are following and there is at least one completed trick
+    if (not perspective.am_i_leader()) and len(history) >= 2:
+        # history[-1] is the current perspective with trick=None
+        # history[-2] is the previous perspective and its Trick
+        _prev_persp, prev_trick = history[-2]
+        if prev_trick is not None:
+            if prev_trick.is_trump_exchange():
+                is_trump_exchange = True
+            else:
+                # Regular or marriage trick: inspect the leader's move
+                leader_move = prev_trick.as_partial().leader_move
+                if leader_move.is_marriage():
+                    is_marriage = True
+                    # Encode the card which was effectively led because of the marriage.
+                    # In this engine, that is the king card via underlying_regular_move(),
+                    # but you can also use queen_card if that matches your dataset expectation.
+                    led_card = leader_move.underlying_regular_move().card if hasattr(leader_move, "underlying_regular_move") else leader_move.queen_card
+                else:
+                    # Plain regular move
+                    led_card = leader_move.card
+
+    for card in SchnapsenDeckGenerator().get_initial_deck():
+        led_active = (not is_marriage and not is_trump_exchange)
+        state_feature_list.append(int(led_active and (led_card == card)))
+        state_feature_list.append(int(is_marriage))
+        state_feature_list.append(int(is_trump_exchange))
+
+    valid_moves = perspective.valid_moves()
+    is_marriage_possible, is_trump_exchange_possible = False, False
+    for card in SchnapsenDeckGenerator().get_initial_deck():
+        is_legal = False
+        for move in valid_moves:
+            if move.is_marriage():
+                is_marriage_possible = True
+            if move.is_trump_exchange():
+                is_trump_exchange_possible = True
+            if move.is_regular_move():
+                if move.card == card:
+                    is_legal = True
+                    break
+        state_feature_list.append(int(is_legal))
+        state_feature_list.append(int(is_marriage_possible))
+        state_feature_list.append(int(is_trump_exchange_possible))
 
     return state_feature_list
+
