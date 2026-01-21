@@ -128,3 +128,46 @@ pdoc --html src/schnapsen executables/ -o doc/
 
 if above doesn't work, try pdoc3, instead of pdoc
 >
+
+
+# ML Bot #
+
+This fork is created to improve the Schnapsen ML Bot that uses a different logic then the one in the original repo. Therefore, slightly tweaked pipeline is introduced.
+
+
+## Getting started with ML Bot ##
+
+To generate historic data for training the bot and create train a model (optional) run: 
+
+```sh
+cd [your_folder]/SchnapsenEnc
+rm -f ML_replay_memories/fresh_replay.mem ML_replay_memories/fresh_model.joblib
+PYTHONPATH=src python executables/generate_ml_replay.py \
+  --games 200 \ 
+  --out ML_replay_memories/fresh_replay.mem \
+  --seed 123 \
+  --overwrite \
+  --train \
+  --model-out ML_replay_memories/fresh_model.joblib
+```
+
+With the following arguments:
+
+* `--games`: number of games to be played to generate data from
+* `--out`: path to save the replay memory
+* `--seed`: random seed for reproducibility
+* `--overwrite`: flag to overwrite existing replay memory file
+* `--train`: flag to train a model after data generation (it is possible to only generate the data)
+* `--model-out`: path to save the trained model
+
+## Testing the bot ##
+
+To run the model against another bot and see the performance, run 
+
+```sh
+cd [your_folder]/SchnapsenEnc
+PYTHONPATH=src python testgame.py
+```
+
+It is also possible to adjust the number of games and the opponent bot in the `testgame.py` file.
+
