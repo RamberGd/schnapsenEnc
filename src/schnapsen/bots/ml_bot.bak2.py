@@ -8,6 +8,7 @@ import joblib
 import time
 import pathlib
 from typing import *
+import ast
 
 
 def map_cards_to_ownership(perspective: PlayerPerspective) -> dict[Card, int]:
@@ -134,15 +135,12 @@ class MLPlayingBot(Bot):
 
         X: list[list[int]] = []
 
-        # Some existing saved models in this repo were trained on the state vector only.
-        # If the model expects 222 features, feed only the state; otherwise feed state+action mask.
-        use_action_mask = self.__expected_n_features not in (222, len(state_representation))
+
 
         for mv in my_valid_moves:
-            if use_action_mask:
-                X.append(state_representation + move_to_mask(mv))
-            else:
-                X.append(state_representation)
+
+            X.append(state_representation + move_to_mask(mv))
+
 
         scores = self._score_candidates(X)
         assert len(scores) == len(my_valid_moves), "Model returned unexpected number of scores"
@@ -319,9 +317,6 @@ class MLDataBot(Bot):
                 if won_label:
                     replay_memory_file.write(f"|| {(trick_list)} \n")
 
-        import ast
-
-
         with open(self.replay_memory_file_path, "r") as f:
             lines = f.readlines()
 
@@ -391,13 +386,35 @@ def train_ML_model(replay_memory_location: Optional[pathlib.Path],
             if not line:
                 continue
 
-            feature_string, target_string = line.split("||")
+            # Support two possible replay formats:
+            # 1) CSV: "f1,f2,... || t1,t2,..." (legacy MLDataBot output)
+            # 2) Python list literals: "[f1, f2, ...] || [t1, t2, ...]" (ml_binary_data_bot output)
+            def parse_part(part: str) -> list[int]:
+                s = part.strip()
+                if not s:
+                    return []
+                # If the part looks like a Python list literal, use ast.literal_eval
+                if s[0] == '[':
+                    parsed = ast.literal_eval(s)
+                    # Ensure booleans become ints and numeric strings are converted
+                    return [int(x) for x in parsed]
+                # Otherwise assume CSV of numbers
+                return [int(v.strip()) for v in s.split(',') if v.strip() != '']
 
-            features = [int(v.strip()) for v in feature_string.split(",")]
-            targets = [int(v.strip()) for v in target_string.split(",")]
+            parts = line.split('||')
+            if len(parts) < 2:
+                # malformed line; skip
+                continue
+            feature_string = parts[0]
+            # join the rest as target in case there are extra '||' tokens
+            target_string = '||'.join(parts[1:])
 
-            X.append(features)
-            y.append(targets)
+            features = parse_part(feature_string)
+            targets = parse_part(target_string)
+
+            if features and targets:
+                X.append(features)
+                y.append(targets)
 
     X = np.array(X, dtype=np.float32)
     Y = np.array(y, dtype=np.float32)
@@ -589,11 +606,8 @@ def get_state_feature_vector(perspective: PlayerPerspective) -> list[int]:
 
     for card in SchnapsenDeckGenerator().get_initial_deck():
         state_feature_list.append(int(card.suit == perspective.get_trump_suit()))
-
-    # --- Correct handling of previous trick when this perspective is the follower ---
-    history = perspective.get_game_history()
     is_marriage, is_trump_exchange, led_card = False, False, None
-
+    history = perspective.get_game_history()
     # Only try to look at a previous trick if we are following and there is at least one completed trick
     if (not perspective.am_i_leader()) and len(history) >= 2:
         # history[-1] is the current perspective with trick=None
@@ -620,6 +634,9 @@ def get_state_feature_vector(perspective: PlayerPerspective) -> list[int]:
         state_feature_list.append(int(led_active and (led_card == card)))
         state_feature_list.append(int(is_marriage))
         state_feature_list.append(int(is_trump_exchange))
+        state_feature_list.append(int(led_active and (led_card == card)))
+        state_feature_list.append(int(is_marriage))
+        state_feature_list.append(int(is_trump_exchange))
 
     valid_moves = perspective.valid_moves()
     is_marriage_possible, is_trump_exchange_possible = False, False
@@ -637,6 +654,6 @@ def get_state_feature_vector(perspective: PlayerPerspective) -> list[int]:
         state_feature_list.append(int(is_legal))
         state_feature_list.append(int(is_marriage_possible))
         state_feature_list.append(int(is_trump_exchange_possible))
-
-    return state_feature_list
-
+        state_feature_list.append(int(is_legal))
+        state_feature_list.append(int(is_marriage_possible))
+        state_feature_list.append(int(is_trump_exchange_possible))
